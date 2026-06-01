@@ -1,2 +1,3 @@
 # Sin dependencias externas.
 # Este sistema usa solo librerias internas de Python: sqlite3, http.server, urllib y random.
+qrcode[pil]==7.4.2
