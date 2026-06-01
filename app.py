@@ -1,16 +1,15 @@
+import base64
 import html
+import io
 import os
 import random
 import re
-import shutil
 import sqlite3
-import sys
-import time
 import uuid
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote_plus, urlparse
 
 BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = BASE_DIR / "rifa.db"
@@ -44,6 +43,52 @@ def get_conn():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
+
+
+def column_exists(conn, table, column):
+    rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+    return any(r["name"] == column for r in rows)
+
+
+def generate_ticket_code(conn):
+    for _ in range(300):
+        code = str(random.randint(100000, 999999))
+        exists = conn.execute("SELECT 1 FROM boletas WHERE codigo_ticket = ?", (code,)).fetchone()
+        if not exists:
+            return code
+    return uuid.uuid4().hex[:10].upper()
+
+
+def normalize_ticket_code(value):
+    return re.sub(r"[^A-Za-z0-9]", "", value or "")
+
+
+def public_base_url(handler):
+    host = handler.headers.get("X-Forwarded-Host") or handler.headers.get("Host") or f"{HOST}:{PORT}"
+    proto = handler.headers.get("X-Forwarded-Proto")
+    if not proto:
+        proto = "https" if "onrender.com" in host else "http"
+    return f"{proto}://{host}"
+
+
+def qr_data_uri(data):
+    try:
+        import qrcode
+
+        img = qrcode.make(data)
+        buffer = io.BytesIO()
+        img.save(buffer, format="PNG")
+        encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
+        return f"data:image/png;base64,{encoded}"
+    except Exception:
+        return ""
+
+
+def qr_img_html(data):
+    uri = qr_data_uri(data)
+    if uri:
+        return f"<img class='ticket-qr' src='{uri}' alt='QR de verificación'>"
+    return f"<div class='qr-fallback'>QR<br>{esc(data)}</div>"
 
 
 def init_db():
@@ -99,6 +144,7 @@ def init_db():
                 venta_id INTEGER NOT NULL,
                 cliente_id INTEGER NOT NULL,
                 numero INTEGER NOT NULL,
+                codigo_ticket TEXT,
                 estado TEXT NOT NULL DEFAULT 'EMITIDA',
                 created_at TEXT NOT NULL,
                 UNIQUE(campania_id, numero),
@@ -108,6 +154,8 @@ def init_db():
             )
             """
         )
+        if not column_exists(conn, "boletas", "codigo_ticket"):
+            cur.execute("ALTER TABLE boletas ADD COLUMN codigo_ticket TEXT")
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS sorteos (
@@ -125,6 +173,15 @@ def init_db():
             )
             """
         )
+        pendientes = conn.execute(
+            "SELECT id FROM boletas WHERE codigo_ticket IS NULL OR TRIM(codigo_ticket) = ''"
+        ).fetchall()
+        for row in pendientes:
+            cur.execute(
+                "UPDATE boletas SET codigo_ticket = ? WHERE id = ?",
+                (generate_ticket_code(conn), row["id"]),
+            )
+        cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_boletas_codigo_ticket ON boletas(codigo_ticket)")
         conn.commit()
 
 
@@ -210,6 +267,9 @@ th {{ background:#eef2ff; }}
 .msg {{ padding:10px 12px; border-radius:8px; background:#ecfdf5; color:#065f46; margin-bottom:12px; }}
 .err {{ background:#fef2f2; color:#991b1b; }}
 .logo-small {{ max-height:48px; max-width:120px; }}
+.search-row {{ display:flex; gap:8px; align-items:end; flex-wrap:wrap; }}
+.search-row > div {{ min-width:260px; flex:1; }}
+.code {{ font-weight:bold; font-size:16px; color:#0b3d91; white-space:nowrap; }}
 @media(max-width:760px) {{ .grid, .grid3 {{ grid-template-columns:1fr; }} }}
 </style>
 {extra_head}
@@ -220,6 +280,7 @@ th {{ background:#eef2ff; }}
 <a href="/">Venta de boletas</a>
 <a href="/campanias">Campañas</a>
 <a href="/ventas">Boletas emitidas</a>
+<a href="/tickets">Buscar tickets</a>
 <a href="/sorteo">Sorteo</a>
 </nav>
 <main>
@@ -253,6 +314,7 @@ class App(BaseHTTPRequestHandler):
             "/": self.page_home,
             "/campanias": self.page_campanias,
             "/ventas": self.page_ventas,
+            "/tickets": self.page_tickets,
             "/sorteo": self.page_sorteo,
             "/boletas/print": self.page_print,
         }
@@ -324,7 +386,7 @@ class App(BaseHTTPRequestHandler):
 </div>
 <div class="card">
 <h3>Notas</h3>
-<p>El costo unitario se toma desde la campaña seleccionada. El sistema guarda la venta, las boletas emitidas, el cliente y el total.</p>
+<p>Cada boleta emitida genera un código único de ticket, por ejemplo <b>#118461</b>, y un QR para buscar/verificar el ticket.</p>
 </div>
 """
         self.send_html(layout("Venta de boletas", body))
@@ -339,7 +401,7 @@ class App(BaseHTTPRequestHandler):
             trs += f"""
 <tr>
 <td>{r['id']}</td><td>{logo}</td><td>{esc(r['nombre'])}</td><td>Gs. {money(r['costo_boleta'])}</td>
-<td>{esc(r['premio'])}</td><td>{esc(r['fecha_sorteo'])}</td><td>{activo}</td>
+<td>{esc(r['premio'])}</td><td>{activo}</td>
 <td>
 <form method="post" action="/campanias/activar" style="display:inline">
 <input type="hidden" name="id" value="{r['id']}">
@@ -356,17 +418,16 @@ class App(BaseHTTPRequestHandler):
 <div><label>Nombre de la rifa / campaña</label><input name="nombre" required></div>
 <div><label>Costo por boleta</label><input type="number" name="costo_boleta" min="0" step="1" value="0" required></div>
 <div><label>Premio</label><input name="premio"></div>
-<div><label>Fecha de sorteo</label><input type="date" name="fecha_sorteo"></div>
 <div><label>Logo</label><input type="file" name="logo" accept="image/*"></div>
 <div><label>Estado</label><select name="activa"><option value="1">Activa</option><option value="0">Inactiva</option></select></div>
-<div style="grid-column:1/-1"><label>Descripción</label><textarea name="descripcion"></textarea></div>
+<div style="grid-column:1/-1"><label>Descripción</label><textarea name="descripcion" placeholder="Opcional. Ejemplo: sorteo al completar los números disponibles."></textarea></div>
 </div>
 <br><button type="submit">Crear campaña</button>
 </form>
 </div>
 <div class="card">
 <h2>Campañas cargadas</h2>
-<table><thead><tr><th>ID</th><th>Logo</th><th>Campaña</th><th>Costo</th><th>Premio</th><th>Fecha sorteo</th><th>Activa</th><th>Acción</th></tr></thead><tbody>{trs or '<tr><td colspan="8">Sin campañas.</td></tr>'}</tbody></table>
+<table><thead><tr><th>ID</th><th>Logo</th><th>Campaña</th><th>Costo</th><th>Premio</th><th>Activa</th><th>Acción</th></tr></thead><tbody>{trs or '<tr><td colspan="7">Sin campañas.</td></tr>'}</tbody></table>
 </div>
 """
         self.send_html(layout("Campañas", body))
@@ -377,7 +438,8 @@ class App(BaseHTTPRequestHandler):
                 """
                 SELECT v.*, c.nombre AS campania, cl.nombre, cl.apellido, cl.telefono,
                        (SELECT MIN(numero) FROM boletas WHERE venta_id = v.id) AS desde,
-                       (SELECT MAX(numero) FROM boletas WHERE venta_id = v.id) AS hasta
+                       (SELECT MAX(numero) FROM boletas WHERE venta_id = v.id) AS hasta,
+                       (SELECT GROUP_CONCAT('#' || codigo_ticket, ', ') FROM boletas WHERE venta_id = v.id) AS tickets
                 FROM ventas v
                 JOIN campanias c ON c.id = v.campania_id
                 JOIN clientes cl ON cl.id = v.cliente_id
@@ -388,23 +450,118 @@ class App(BaseHTTPRequestHandler):
         trs = ""
         for r in rows:
             rango = str(r["desde"]) if r["desde"] == r["hasta"] else f"{r['desde']} - {r['hasta']}"
+            tickets = esc(r["tickets"] or "")
             trs += f"""
 <tr>
 <td>{r['id']}</td><td>{esc(r['created_at'])}</td><td>{esc(r['campania'])}</td>
 <td>{esc(r['nombre'])} {esc(r['apellido'])}</td><td>{esc(r['telefono'])}</td>
-<td>{r['cantidad']}</td><td>{esc(rango)}</td><td>Gs. {money(r['costo_unitario'])}</td><td>Gs. {money(r['total'])}</td>
-<td><a class="btn" href="/boletas/print?venta_id={r['id']}">Imprimir</a></td>
+<td>{r['cantidad']}</td><td>{esc(rango)}</td><td class="code">{tickets}</td><td>Gs. {money(r['costo_unitario'])}</td><td>Gs. {money(r['total'])}</td>
+<td><a class="btn" href="/boletas/print?venta_id={r['id']}">Imprimir/PDF</a></td>
 </tr>"""
         body = f"""
 <div class="card">
 <h2>Boletas emitidas</h2>
+<p>Para buscar una boleta específica por código, use el buscador de tickets.</p>
+<a class="btn btn-secondary" href="/tickets">Buscar ticket</a>
+<br><br>
 <table>
-<thead><tr><th>Venta</th><th>Fecha</th><th>Campaña</th><th>Cliente</th><th>Teléfono</th><th>Cant.</th><th>Boletas</th><th>Costo unit.</th><th>Total</th><th></th></tr></thead>
-<tbody>{trs or '<tr><td colspan="10">Sin ventas.</td></tr>'}</tbody>
+<thead><tr><th>Venta</th><th>Fecha</th><th>Campaña</th><th>Cliente</th><th>Teléfono</th><th>Cant.</th><th>Boletas</th><th>Tickets</th><th>Costo unit.</th><th>Total</th><th></th></tr></thead>
+<tbody>{trs or '<tr><td colspan="11">Sin ventas.</td></tr>'}</tbody>
 </table>
 </div>
 """
         self.send_html(layout("Ventas", body))
+
+    def page_tickets(self, parsed):
+        params = parse_qs(parsed.query)
+        q = params.get("q", [""])[0].strip()
+        clean = normalize_ticket_code(q)
+        rows = []
+        with get_conn() as conn:
+            if q:
+                rows = conn.execute(
+                    """
+                    SELECT b.id AS boleta_id, b.numero, b.codigo_ticket, b.estado, b.created_at,
+                           v.id AS venta_id, v.cantidad, v.costo_unitario, v.total,
+                           c.nombre AS campania, c.premio,
+                           cl.nombre, cl.apellido, cl.telefono, cl.direccion
+                    FROM boletas b
+                    JOIN ventas v ON v.id = b.venta_id
+                    JOIN campanias c ON c.id = b.campania_id
+                    JOIN clientes cl ON cl.id = b.cliente_id
+                    WHERE b.codigo_ticket LIKE ?
+                       OR CAST(b.numero AS TEXT) LIKE ?
+                       OR CAST(v.id AS TEXT) = ?
+                       OR cl.nombre LIKE ?
+                       OR cl.apellido LIKE ?
+                       OR cl.telefono LIKE ?
+                       OR c.nombre LIKE ?
+                    ORDER BY b.id DESC
+                    LIMIT 200
+                    """,
+                    (
+                        f"%{clean}%",
+                        f"%{clean}%",
+                        clean,
+                        f"%{q}%",
+                        f"%{q}%",
+                        f"%{q}%",
+                        f"%{q}%",
+                    ),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT b.id AS boleta_id, b.numero, b.codigo_ticket, b.estado, b.created_at,
+                           v.id AS venta_id, v.cantidad, v.costo_unitario, v.total,
+                           c.nombre AS campania, c.premio,
+                           cl.nombre, cl.apellido, cl.telefono, cl.direccion
+                    FROM boletas b
+                    JOIN ventas v ON v.id = b.venta_id
+                    JOIN campanias c ON c.id = b.campania_id
+                    JOIN clientes cl ON cl.id = b.cliente_id
+                    ORDER BY b.id DESC
+                    LIMIT 100
+                    """
+                ).fetchall()
+        trs = ""
+        for r in rows:
+            code = f"#{r['codigo_ticket']}" if r["codigo_ticket"] else ""
+            trs += f"""
+<tr>
+<td class="code">{esc(code)}</td>
+<td>{int(r['numero']):06d}</td>
+<td>{esc(r['campania'])}</td>
+<td>{esc(r['nombre'])} {esc(r['apellido'])}</td>
+<td>{esc(r['telefono'])}</td>
+<td>{esc(r['estado'])}</td>
+<td>{esc(r['created_at'])}</td>
+<td>
+<a class="btn" href="/boletas/print?ticket_id={r['boleta_id']}">Imprimir/PDF</a>
+<a class="btn btn-secondary" href="/boletas/print?venta_id={r['venta_id']}">Venta completa</a>
+</td>
+</tr>"""
+        notice = ""
+        if q and not rows:
+            notice = "<div class='card err'>No se encontraron tickets con ese criterio.</div>"
+        body = f"""
+<div class="card">
+<h2>Buscador de tickets emitidos</h2>
+<form method="get" action="/tickets" class="search-row">
+<div><label>Buscar por código, número, venta, cliente, teléfono o campaña</label><input name="q" value="{esc(q)}" placeholder="#118461, 118461, cliente, teléfono..."></div>
+<div><button type="submit">Buscar</button></div>
+</form>
+</div>
+{notice}
+<div class="card">
+<h2>{'Resultados' if q else 'Últimos tickets emitidos'}</h2>
+<table>
+<thead><tr><th>Ticket</th><th>Boleta N°</th><th>Campaña</th><th>Cliente</th><th>Teléfono</th><th>Estado</th><th>Emitido</th><th>Acciones</th></tr></thead>
+<tbody>{trs or '<tr><td colspan="8">Sin tickets emitidos.</td></tr>'}</tbody>
+</table>
+</div>
+"""
+        self.send_html(layout("Buscar tickets", body))
 
     def page_sorteo(self, parsed):
         query = parse_qs(parsed.query)
@@ -427,7 +584,8 @@ class App(BaseHTTPRequestHandler):
                     FROM sorteos s
                     JOIN campanias c ON c.id = s.campania_id
                     WHERE s.id = ?
-                    """, (ganador_id,)
+                    """,
+                    (ganador_id,),
                 ).fetchone()
         opts = "".join(f"<option value='{c['id']}'>{esc(c['nombre'])}</option>" for c in campanias)
         ganador_html = ""
@@ -439,7 +597,7 @@ class App(BaseHTTPRequestHandler):
 <p><b>Boleta:</b> {ganador['numero']}</p>
 <p><b>Cliente:</b> {esc(ganador['ganador_nombre'])}</p>
 <p><b>Teléfono:</b> {esc(ganador['ganador_telefono'])}</p>
-<p><b>Fecha:</b> {esc(ganador['fecha_sorteo'])}</p>
+<p><b>Fecha del sorteo realizado:</b> {esc(ganador['fecha_sorteo'])}</p>
 </div>"""
         trs = ""
         for s in sorteos:
@@ -457,7 +615,7 @@ class App(BaseHTTPRequestHandler):
 </div>
 <div class="card">
 <h2>Historial de sorteos</h2>
-<table><thead><tr><th>ID</th><th>Fecha</th><th>Campaña</th><th>Boleta</th><th>Ganador</th><th>Teléfono</th></tr></thead><tbody>{trs or '<tr><td colspan="6">Sin sorteos.</td></tr>'}</tbody></table>
+<table><thead><tr><th>ID</th><th>Fecha realizada</th><th>Campaña</th><th>Boleta</th><th>Ganador</th><th>Teléfono</th></tr></thead><tbody>{trs or '<tr><td colspan="6">Sin sorteos.</td></tr>'}</tbody></table>
 </div>
 """
         self.send_html(layout("Sorteo", body))
@@ -465,64 +623,111 @@ class App(BaseHTTPRequestHandler):
     def page_print(self, parsed):
         query = parse_qs(parsed.query)
         venta_id = query.get("venta_id", [""])[0]
-        with get_conn() as conn:
-            venta = conn.execute(
-                """
-                SELECT v.*, c.nombre AS campania, c.costo_boleta, c.logo_path, c.premio, c.fecha_sorteo,
-                       cl.nombre, cl.apellido, cl.direccion, cl.telefono
-                FROM ventas v
-                JOIN campanias c ON c.id = v.campania_id
-                JOIN clientes cl ON cl.id = v.cliente_id
-                WHERE v.id = ?
-                """, (venta_id,)
-            ).fetchone()
-            boletas = conn.execute("SELECT * FROM boletas WHERE venta_id = ? ORDER BY numero", (venta_id,)).fetchall()
-        if not venta:
-            self.send_html(layout("Imprimir", "<div class='card err'>Venta no encontrada.</div>"), 404)
+        ticket_id = query.get("ticket_id", [""])[0]
+        codigo = normalize_ticket_code(query.get("codigo", [""])[0])
+        where = ""
+        params = ()
+        title_suffix = ""
+        if ticket_id:
+            where = "b.id = ?"
+            params = (ticket_id,)
+            title_suffix = f"ticket_{ticket_id}"
+        elif codigo:
+            where = "b.codigo_ticket = ?"
+            params = (codigo,)
+            title_suffix = f"ticket_{codigo}"
+        elif venta_id:
+            where = "v.id = ?"
+            params = (venta_id,)
+            title_suffix = f"venta_{venta_id}"
+        else:
+            self.send_html(layout("Imprimir", "<div class='card err'>Debe indicar venta_id o ticket_id.</div>"), 400)
             return
-        logo = f"<img class='ticket-logo' src='/{esc(venta['logo_path'])}'>" if venta["logo_path"] else ""
+
+        with get_conn() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT b.id AS boleta_id, b.numero, b.codigo_ticket, b.estado, b.created_at AS boleta_created_at,
+                       v.id AS venta_id, v.cantidad, v.costo_unitario, v.total, v.created_at AS venta_created_at,
+                       c.nombre AS campania, c.costo_boleta, c.logo_path, c.premio,
+                       cl.nombre, cl.apellido, cl.direccion, cl.telefono
+                FROM boletas b
+                JOIN ventas v ON v.id = b.venta_id
+                JOIN campanias c ON c.id = b.campania_id
+                JOIN clientes cl ON cl.id = b.cliente_id
+                WHERE {where}
+                ORDER BY b.numero
+                """,
+                params,
+            ).fetchall()
+        if not rows:
+            self.send_html(layout("Imprimir", "<div class='card err'>Ticket o venta no encontrada.</div>"), 404)
+            return
+
+        base = public_base_url(self)
         tickets = ""
-        for b in boletas:
+        for r in rows:
+            logo = f"<img class='ticket-logo' src='/{esc(r['logo_path'])}'>" if r["logo_path"] else ""
+            code = r["codigo_ticket"] or ""
+            code_display = f"#{code}" if code else "Sin código"
+            verify_url = f"{base}/tickets?q={quote_plus('#' + code)}" if code else f"{base}/tickets"
+            qr_html = qr_img_html(verify_url)
             tickets += f"""
 <section class="ticket">
 {logo}
-<h2>{esc(venta['campania'])}</h2>
-<div class="num">N° {b['numero']:06d}</div>
+<h2>{esc(r['campania'])}</h2>
+<div class="ticket-code">{esc(code_display)}</div>
+<div class="num">Boleta N° {int(r['numero']):06d}</div>
+<div class="qr-wrap">{qr_html}</div>
 <div class="line"></div>
-<p><b>Cliente:</b> {esc(venta['nombre'])} {esc(venta['apellido'])}</p>
-<p><b>Teléfono:</b> {esc(venta['telefono'])}</p>
-<p><b>Dirección:</b> {esc(venta['direccion'])}</p>
-<p><b>Premio:</b> {esc(venta['premio'])}</p>
-<p><b>Fecha sorteo:</b> {esc(venta['fecha_sorteo'])}</p>
-<p><b>Costo:</b> Gs. {money(venta['costo_unitario'])}</p>
-<p><b>Emitido:</b> {esc(b['created_at'])}</p>
+<p><b>Venta:</b> {r['venta_id']}</p>
+<p><b>Cliente:</b> {esc(r['nombre'])} {esc(r['apellido'])}</p>
+<p><b>Teléfono:</b> {esc(r['telefono'])}</p>
+<p><b>Dirección:</b> {esc(r['direccion'])}</p>
+<p><b>Premio:</b> {esc(r['premio'])}</p>
+<p><b>Costo:</b> Gs. {money(r['costo_unitario'])}</p>
+<p><b>Emitido:</b> {esc(r['boleta_created_at'])}</p>
 <div class="line"></div>
-<p class="small">Conserve esta boleta para participar del sorteo.</p>
+<p class="small">Escanee el QR o busque el código {esc(code_display)} para verificar este ticket.</p>
+<p class="small">Conserve esta boleta para participar del sorteo. No reemplaza factura legal ni comprobante fiscal.</p>
 </section>"""
-        extra = """
+        safe_title = re.sub(r"[^A-Za-z0-9_-]", "_", title_suffix or "tickets")
+        extra = f"""
 <style>
-body { background:white; }
-.no-print { margin:12px; }
-.ticket { width:72mm; padding:4mm; margin:0 auto 6mm auto; border-bottom:1px dashed #000; font-family: Arial, Helvetica, sans-serif; color:#000; }
-.ticket h2 { font-size:16px; text-align:center; margin:4px 0; }
-.ticket p { font-size:12px; margin:4px 0; }
-.ticket-logo { display:block; max-width:42mm; max-height:22mm; margin:0 auto 4px auto; }
-.num { font-size:24px; text-align:center; font-weight:bold; margin:6px 0; }
-.line { border-top:1px dashed #000; margin:6px 0; }
-.small { font-size:10px !important; text-align:center; }
-@media print {
-  header, nav, .no-print { display:none !important; }
-  main { padding:0; max-width:none; }
-  .ticket { width:72mm; margin:0; page-break-after:always; }
-  @page { size:80mm auto; margin:0; }
-}
+body {{ background:white; }}
+.no-print {{ margin:12px; }}
+.ticket {{ width:72mm; padding:4mm; margin:0 auto 6mm auto; border-bottom:1px dashed #000; font-family: Arial, Helvetica, sans-serif; color:#000; text-align:left; }}
+.ticket h2 {{ font-size:16px; text-align:center; margin:4px 0; }}
+.ticket p {{ font-size:12px; margin:4px 0; }}
+.ticket-logo {{ display:block; max-width:42mm; max-height:22mm; margin:0 auto 4px auto; }}
+.ticket-code {{ font-size:28px; text-align:center; font-weight:bold; margin:6px 0 2px 0; letter-spacing:1px; }}
+.num {{ font-size:15px; text-align:center; font-weight:bold; margin:2px 0 6px 0; }}
+.qr-wrap {{ display:flex; justify-content:center; margin:6px 0; }}
+.ticket-qr {{ width:30mm; height:30mm; }}
+.qr-fallback {{ width:30mm; min-height:30mm; border:1px solid #000; font-size:8px; overflow:hidden; padding:2mm; text-align:center; word-break:break-all; }}
+.line {{ border-top:1px dashed #000; margin:6px 0; }}
+.small {{ font-size:10px !important; text-align:center; }}
+@media print {{
+  header, nav, .no-print {{ display:none !important; }}
+  main {{ padding:0; max-width:none; }}
+  .ticket {{ width:72mm; margin:0; page-break-after:always; }}
+  @page {{ size:80mm auto; margin:0; }}
+}}
 </style>
+<script>
+function guardarPDF() {{
+  document.title = "{safe_title}";
+  window.print();
+}}
+</script>
 """
         body = f"""
 <div class="no-print">
 <button onclick="window.print()">Imprimir en térmica</button>
-<a class="btn btn-secondary" href="/">Volver</a>
-<p>En Chrome/Edge seleccionar impresora térmica, margen ninguno, escala 100%, sin encabezado ni pie.</p>
+<button onclick="guardarPDF()" class="btn-secondary">Guardar PDF</button>
+<a class="btn btn-secondary" href="/tickets">Buscar tickets</a>
+<a class="btn btn-secondary" href="/ventas">Volver</a>
+<p>Para guardar en PDF, presione <b>Guardar PDF</b> y en la ventana de impresión elija <b>Destino: Guardar como PDF</b>. Para impresora térmica use margen ninguno, escala 100%, sin encabezado ni pie.</p>
 </div>
 {tickets}
 """
@@ -560,7 +765,7 @@ body { background:white; }
                     fields.get("descripcion", ""),
                     costo,
                     fields.get("premio", ""),
-                    fields.get("fecha_sorteo", ""),
+                    "",
                     logo_path,
                     int(fields.get("activa", "1") or 1),
                     now_str(),
@@ -610,9 +815,13 @@ body { background:white; }
             row = conn.execute("SELECT COALESCE(MAX(numero), 0) AS max_num FROM boletas WHERE campania_id = ?", (campania_id,)).fetchone()
             inicio = int(row["max_num"] or 0) + 1
             for i in range(cantidad):
+                codigo_ticket = generate_ticket_code(conn)
                 cur.execute(
-                    "INSERT INTO boletas(campania_id, venta_id, cliente_id, numero, estado, created_at) VALUES (?, ?, ?, ?, 'EMITIDA', ?)",
-                    (campania_id, venta_id, cliente_id, inicio + i, now_str()),
+                    """
+                    INSERT INTO boletas(campania_id, venta_id, cliente_id, numero, codigo_ticket, estado, created_at)
+                    VALUES (?, ?, ?, ?, ?, 'EMITIDA', ?)
+                    """,
+                    (campania_id, venta_id, cliente_id, inicio + i, codigo_ticket, now_str()),
                 )
             conn.commit()
         self.redirect(f"/boletas/print?venta_id={venta_id}")
@@ -627,7 +836,8 @@ body { background:white; }
                 FROM boletas b
                 JOIN clientes cl ON cl.id = b.cliente_id
                 WHERE b.campania_id = ?
-                """, (campania_id,)
+                """,
+                (campania_id,),
             ).fetchall()
             if not boletas:
                 self.send_html(layout("Sorteo", "<div class='card err'>No hay boletas emitidas para esta campaña.</div><a class='btn' href='/sorteo'>Volver</a>"), 400)
