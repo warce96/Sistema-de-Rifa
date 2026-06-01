@@ -1,0 +1,12 @@
+Deploy en Render
+================
+
+1. En Render crear New > Web Service, no Static Site.
+2. Root Directory: Sistema de Rifa si el repositorio mantiene esta carpeta.
+   Alternativa: subir app.py, requirements.txt, rifa.db y static directamente en la raiz del repositorio.
+3. Build Command: pip install -r requirements.txt
+4. Start Command: python app.py
+5. El codigo usa HOST=0.0.0.0 y PORT desde la variable de entorno PORT de Render.
+
+Nota importante:
+- rifa.db es SQLite local. En Render Free los cambios se pueden perder tras reinicios/redeploys. Para produccion use Render Postgres o un disco persistente en plan pago.
