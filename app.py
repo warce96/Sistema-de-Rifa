@@ -19,6 +19,7 @@ LOGOS_DIR.mkdir(parents=True, exist_ok=True)
 
 HOST = os.environ.get("HOST", "0.0.0.0")
 PORT = int(os.environ.get("PORT", "5000"))
+QR_LINK = "https://www.instagram.com/asgarageasuncion?utm_source=qr"
 
 
 def now_str():
@@ -87,7 +88,7 @@ def qr_data_uri(data):
 def qr_img_html(data):
     uri = qr_data_uri(data)
     if uri:
-        return f"<img class='ticket-qr' src='{uri}' alt='QR de verificación'>"
+        return f"<img class='ticket-qr' src='{uri}' alt='QR de Instagram'>"
     return f"<div class='qr-fallback'>QR<br>{esc(data)}</div>"
 
 
@@ -386,7 +387,7 @@ class App(BaseHTTPRequestHandler):
 </div>
 <div class="card">
 <h3>Notas</h3>
-<p>Cada boleta emitida genera un código único de ticket, por ejemplo <b>#118461</b>, y un QR para buscar/verificar el ticket.</p>
+<p>Cada boleta emitida genera un código único de ticket, por ejemplo <b>#118461</b>. El QR del comprobante apunta al Instagram oficial.</p>
 </div>
 """
         self.send_html(layout("Venta de boletas", body))
@@ -664,14 +665,12 @@ class App(BaseHTTPRequestHandler):
             self.send_html(layout("Imprimir", "<div class='card err'>Ticket o venta no encontrada.</div>"), 404)
             return
 
-        base = public_base_url(self)
         tickets = ""
         for r in rows:
             logo = f"<img class='ticket-logo' src='/{esc(r['logo_path'])}'>" if r["logo_path"] else ""
             code = r["codigo_ticket"] or ""
             code_display = f"#{code}" if code else "Sin código"
-            verify_url = f"{base}/tickets?q={quote_plus('#' + code)}" if code else f"{base}/tickets"
-            qr_html = qr_img_html(verify_url)
+            qr_html = qr_img_html(QR_LINK)
             tickets += f"""
 <section class="ticket">
 {logo}
@@ -688,7 +687,7 @@ class App(BaseHTTPRequestHandler):
 <p><b>Costo:</b> Gs. {money(r['costo_unitario'])}</p>
 <p><b>Emitido:</b> {esc(r['boleta_created_at'])}</p>
 <div class="line"></div>
-<p class="small">Escanee el QR o busque el código {esc(code_display)} para verificar este ticket.</p>
+<p class="small">Escanee el QR para abrir Instagram. Para control interno, busque el código {esc(code_display)} en el sistema.</p>
 <p class="small">Conserve esta boleta para participar del sorteo. No reemplaza factura legal ni comprobante fiscal.</p>
 </section>"""
         safe_title = re.sub(r"[^A-Za-z0-9_-]", "_", title_suffix or "tickets")
